@@ -144,6 +144,7 @@ contextBridge.exposeInMainWorld("electronAPI", {
   },
 
   player: {
+    openMacVlc: (url) => ipcRenderer.invoke("player-open-mac-vlc", url),
     getAll: () => ipcRenderer.invoke("player-get-all"),
     getDefault: () => ipcRenderer.invoke("player-get-default"),
     setDefault: (playerId) =>

@@ -2,8 +2,16 @@
 const { ipcMain } = require("electron");
 const playerFinder = require("../playerFinder");
 const { getMainWindow } = require("../windowManager");
+const { openMacVlc } = require("../macVlc");
 
 function registerPlayerHandlers() {
+  ipcMain.handle("player-open-mac-vlc", async (event, url) => {
+    if (event.sender !== getMainWindow()?.webContents) {
+      return { success: false, error: "Unknown application window" };
+    }
+    return openMacVlc(url);
+  });
+
   // Получить все плееры
   ipcMain.handle("player-get-all", async () => {
     return await playerFinder.getAllPlayers();
