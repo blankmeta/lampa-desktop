@@ -18,6 +18,15 @@ function loadPlugin({
   const events = new Map();
   const appEvents = [];
   const opened = [];
+  const requests = [];
+  const acknowledgements = [];
+  const records = new Map();
+  const timelineReads = [];
+  let storageKey = "file_view";
+  let pending = [];
+  let receiveProgress;
+  let receiveWarning;
+  let prompt;
   const external = [];
   const messages = [];
   const settings = {
@@ -36,10 +45,42 @@ function loadPlugin({
         this.defaults[name] = fallback;
       },
     },
-    Storage: { field: (name) => settings[name] },
+    Storage: {
+      field: (name) =>
+        settings[name] ?? (name === "player_timecode" ? "continue" : false),
+    },
     Lang: { add() {}, translate: (key) => key },
     Noty: { show: (message) => messages.push(message) },
     Listener: { follow: (_name, callback) => appEvents.push(callback) },
+    Controller: { enabled: () => ({ name: "content" }), toggle() {} },
+    Select: {
+      show: (value) => {
+        prompt = value;
+      },
+    },
+    Utils: { secondsToTime: String },
+    Timeline: {
+      filename: () => storageKey,
+      listener: { follow: (_name, callback) => timelineReads.push(callback) },
+      view: (hash, meta = {}) => ({
+        hash,
+        time: 0,
+        duration: 0,
+        percent: 0,
+        profile:
+          Number(storageKey.replace("file_view", "").replace("_", "")) || 0,
+        updated: 0,
+        ...records.get(`${storageKey}:${hash}`),
+        handler: (percent, time, duration) =>
+          records.set(`${storageKey}:${hash}`, {
+            ...meta,
+            percent,
+            time,
+            duration,
+            updated: Date.now(),
+          }),
+      }),
+    },
     Player: {
       runas() {},
       iptv: () => nativeIptv++,
@@ -65,9 +106,23 @@ function loadPlugin({
     appready: ready,
     electronAPI: {
       player: {
-        openMacVlc: async (url) => {
-          opened.push(url);
-          return launchResult;
+        openMacVlc: async (request) => {
+          requests.push(JSON.parse(JSON.stringify(request)));
+          opened.push(request.url);
+          return { ...launchResult, id: `session-${requests.length}` };
+        },
+        getMacVlcTimecodes: async () => pending,
+        acknowledgeMacVlcTimecode: async (id, version) => {
+          acknowledgements.push({ id, version });
+          pending = pending.filter(
+            (entry) => entry.id !== id || entry.version !== version,
+          );
+        },
+        onMacVlcProgress: (callback) => {
+          receiveProgress = callback;
+        },
+        onMacVlcWarning: (callback) => {
+          receiveWarning = callback;
         },
       },
     },
@@ -88,6 +143,19 @@ function loadPlugin({
     Lampa,
     settings,
     opened,
+    requests,
+    acknowledgements,
+    records,
+    timelineReads,
+    setProfile: (value) => {
+      storageKey = value;
+    },
+    setPending: (value) => {
+      pending = value;
+    },
+    progress: (value) => receiveProgress(value),
+    warn: () => receiveWarning(),
+    prompt: () => prompt,
     external,
     messages,
     appEvents,
@@ -119,6 +187,7 @@ test("opens online and torrent videos with their separate player selections", as
     }),
     true,
   );
+  await new Promise(setImmediate);
   assert.equal(app.play({ url: "https://example.com/movie.mp4" }), false);
   app.settings.player = "vlc";
   assert.equal(app.play({ url: "https://example.com/movie.mp4" }), true);
@@ -190,16 +259,206 @@ test("waits for the existing IPTV parental-control check before opening VLC", as
   assert.deepEqual(app.opened, [data.url]);
 });
 
-test("waits for app readiness and does not install on other platforms", () => {
+test("waits for app readiness and does not install on other platforms", async () => {
   const app = loadPlugin({ ready: false });
   assert.equal(app.Lampa.Params.values.player.vlc, undefined);
   for (let i = 0; i < 2; i++) app.appEvents[0]({ type: "ready" });
   app.settings.player = "vlc";
   app.reinject();
   assert.equal(app.play({ url: "https://example.com/movie.mp4" }), true);
+  await new Promise(setImmediate);
   assert.equal(app.opened.length, 1);
   assert.equal(
     loadPlugin({ mac: false }).Lampa.Params.values.player.vlc,
     undefined,
   );
+});
+
+test("reloads saved progress instead of trusting a stale search result", async () => {
+  const app = loadPlugin();
+  app.settings.player = "vlc";
+  app.records.set("file_view:movie", {
+    time: 420,
+    duration: 1200,
+    percent: 35,
+  });
+  const stale = { hash: "movie", time: 0, duration: 0, percent: 0 };
+  app.play({ url: "https://example.com/movie.mp4", timeline: stale });
+  await new Promise(setImmediate);
+  assert.equal(app.requests[0].startTime, 420);
+  assert.equal(app.requests[0].timeline.hash, "movie");
+  assert.equal(app.requests[0].timeline.storageKey, "file_view");
+  assert.equal(app.requests[0].timeline.handler, undefined);
+  assert.equal(stale.time, 420);
+});
+
+test("honors again/continue/ask and restarts completed movies from zero", async () => {
+  const app = loadPlugin();
+  app.settings.player = "vlc";
+  app.records.set("file_view:movie", {
+    time: 420,
+    duration: 1200,
+    percent: 35,
+  });
+  const data = {
+    url: "https://example.com/movie.mp4",
+    timeline: { hash: "movie" },
+  };
+  app.settings.player_timecode = "again";
+  app.play(data);
+  await new Promise(setImmediate);
+  assert.equal(app.requests[0].startTime, 0);
+  app.settings.player_timecode = "ask";
+  app.play(data);
+  await new Promise(setImmediate);
+  assert.equal(app.requests.length, 1);
+  app.prompt().onSelect({ resume: true });
+  await new Promise(setImmediate);
+  assert.equal(app.requests[1].startTime, 420);
+  app.play(data);
+  await new Promise(setImmediate);
+  app.prompt().onBack();
+  await new Promise(setImmediate);
+  assert.equal(app.requests.length, 2);
+  app.settings.player_timecode = "continue";
+  app.records.set("file_view:movie", {
+    time: 1195,
+    duration: 1200,
+    percent: 99,
+  });
+  app.play(data);
+  await new Promise(setImmediate);
+  assert.equal(app.requests[2].startTime, 0);
+});
+
+test("updates the original timeline callback and in-memory values while watching", async () => {
+  const app = loadPlugin();
+  app.settings.player = "vlc";
+  const timeline = app.Lampa.Timeline.view("movie");
+  app.play({ url: "https://example.com/movie.mp4", timeline });
+  await new Promise(setImmediate);
+  const sample = {
+    id: "session-1",
+    version: 1,
+    time: 400,
+    duration: 1000,
+    percent: 40,
+    updatedAt: Date.now(),
+    timeline: { hash: "movie", storageKey: "file_view" },
+  };
+  app.progress(sample);
+  assert.equal(timeline.time, 400);
+  assert.equal(app.records.get("file_view:movie").time, 400);
+  app.progress({ ...sample, version: 2, time: 100, percent: 10 });
+  assert.equal(app.records.get("file_view:movie").time, 100);
+  app.progress(sample);
+  assert.equal(app.records.get("file_view:movie").time, 100);
+  assert.equal(app.acknowledgements.length, 3);
+});
+
+test("restores pending progress only to its original profile after a reload", async () => {
+  const app = loadPlugin();
+  const sample = {
+    id: "old-session",
+    version: 3,
+    time: 400,
+    duration: 1000,
+    percent: 40,
+    updatedAt: Date.now(),
+    timeline: { hash: "movie", storageKey: "file_view_2" },
+  };
+  app.setPending([sample]);
+  app.timelineReads[0]();
+  await new Promise(setImmediate);
+  assert.equal(app.records.size, 0);
+  assert.equal(app.acknowledgements.length, 0);
+  app.setProfile("file_view_2");
+  app.timelineReads[0]();
+  await new Promise(setImmediate);
+  assert.equal(app.records.get("file_view_2:movie").time, 400);
+  assert.equal(app.acknowledgements.length, 1);
+});
+
+test("never replays an older checkpoint over a newer Lampa timeline", () => {
+  const app = loadPlugin();
+  app.records.set("file_view:movie", { time: 900, updated: Date.now() + 1000 });
+  app.progress({
+    id: "old-session",
+    version: 1,
+    time: 400,
+    duration: 1000,
+    percent: 40,
+    updatedAt: Date.now(),
+    timeline: { hash: "movie", storageKey: "file_view" },
+  });
+  assert.equal(app.records.get("file_view:movie").time, 900);
+  assert.equal(app.acknowledgements.length, 1);
+});
+
+test("recording opt-out sends no timeline and rapid clicks launch only the latest item", async () => {
+  const app = loadPlugin();
+  app.settings.player = "vlc";
+  app.play({ url: "https://example.com/old.mp4" });
+  app.play({
+    url: "https://example.com/new.mp4",
+    timeline: { hash: "movie", stop_recording: true },
+  });
+  await new Promise(setImmediate);
+  assert.deepEqual(app.opened, ["https://example.com/new.mp4"]);
+  assert.equal(app.requests[0].timeline, null);
+  app.warn();
+  assert.equal(app.messages[0], "desktop_vlc_sync_failed");
+});
+
+test("a profile change while answering the resume dialog cancels the old launch", async () => {
+  const app = loadPlugin();
+  app.settings.player = "vlc";
+  app.settings.player_timecode = "ask";
+  app.records.set("file_view:movie", {
+    time: 420,
+    duration: 1200,
+    percent: 35,
+  });
+  app.play({
+    url: "https://example.com/movie.mp4",
+    timeline: { hash: "movie" },
+  });
+  await new Promise(setImmediate);
+  app.setProfile("file_view_2");
+  app.prompt().onSelect({ resume: true });
+  await new Promise(setImmediate);
+  assert.equal(app.opened.length, 0);
+});
+
+test("rebinds a stale timeline callback to the currently selected profile", async () => {
+  const app = loadPlugin();
+  app.settings.player = "vlc";
+  app.setProfile("file_view_2");
+  app.records.set("file_view_2:movie", {
+    time: 80,
+    duration: 1000,
+    percent: 8,
+    profile: 2,
+  });
+  const timeline = {
+    hash: "movie",
+    profile: 1,
+    handler: () => {
+      throw new Error("stale profile handler");
+    },
+  };
+  app.play({ url: "https://example.com/movie.mp4", timeline });
+  await new Promise(setImmediate);
+  assert.equal(app.requests[0].timeline.profile, 2);
+  app.progress({
+    id: "session-1",
+    version: 1,
+    time: 85,
+    duration: 1000,
+    percent: 9,
+    updatedAt: Date.now(),
+    timeline: { hash: "movie", storageKey: "file_view_2" },
+  });
+  assert.equal(app.records.get("file_view_2:movie").time, 85);
+  assert.equal(app.records.has("file_view:movie"), false);
 });
